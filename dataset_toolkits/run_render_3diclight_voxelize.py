@@ -1,0 +1,112 @@
+import os
+import json
+import copy
+import sys
+import importlib
+import argparse
+import pandas as pd
+from easydict import EasyDict as edict
+from functools import partial
+from subprocess import DEVNULL, call
+import numpy as np
+from utils import sphere_hammersley_sequence, equator_cameras_sequence
+import tqdm
+
+import open3d as o3d
+import utils3d
+
+from concurrent.futures import ThreadPoolExecutor, as_completed  
+
+
+def _voxelize(file, sha256, level, output_dir, out_basename):
+    mesh = o3d.io.read_triangle_mesh(os.path.join(output_dir, 'even_render_6k_mesh', f'level_{level}', sha256, 'mesh.ply'))
+    # clamp vertices to the range [-0.5, 0.5]
+    vertices = np.clip(np.asarray(mesh.vertices), -0.5 + 1e-6, 0.5 - 1e-6)
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    voxel_grid = o3d.geometry.VoxelGrid.create_from_triangle_mesh_within_bounds(mesh, voxel_size=1/64, min_bound=(-0.5, -0.5, -0.5), max_bound=(0.5, 0.5, 0.5))
+    vertices = np.array([voxel.grid_index for voxel in voxel_grid.get_voxels()])
+    assert np.all(vertices >= 0) and np.all(vertices < 64), "Some vertices are out of bounds"
+    vertices = (vertices + 0.5) / 64 - 0.5
+    utils3d.io.write_ply(os.path.join(output_dir, out_basename, f'level_{level}', f'{sha256}.ply'), vertices)
+    return {'sha256': sha256, 'voxelized': True, 'num_voxels': len(vertices)}
+
+
+def check_processed(sha256, level, output_dir, out_basename):  
+    mesh_path = os.path.join(output_dir, out_basename, f'level_{level}', f'{sha256}.ply')
+    # return sha256 if os.path.exists(path) else None 
+    return sha256 if os.path.exists(mesh_path) else None
+
+def filter_processed(metadata, opt, max_workers=16):  
+    print("Filter out objects that are already processed")  
+
+    sha256_list = copy.copy(metadata['sha256'].values)  
+    level_list = copy.copy(metadata['level'].values)
+    processed = []  
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:  
+        futures = {executor.submit(check_processed, sha, lvl, opt.output_dir, opt.out_basename): sha for sha, lvl in zip(sha256_list, level_list)}
+        for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="Checking processed"):  
+            sha = future.result()  
+            if sha is not None:  
+                processed.append({'sha256': sha, 'rendered': True})  
+
+    processed_sha256 = set(p['sha256'] for p in processed)  
+    filtered_metadata = metadata[~metadata['sha256'].isin(processed_sha256)]  
+
+    print(f'Processing {len(filtered_metadata)} objects...')  
+
+    return filtered_metadata, processed 
+
+
+if __name__ == '__main__':
+    dataset_utils = importlib.import_module(f'datasets.{sys.argv[1]}')
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output_dir', type=str, default="3diclight_matsynth",
+                        help='Directory to save the metadata')
+    parser.add_argument('--metadata_dir', type=str, default="metadatas",
+                        help='Directory to save the metadata')
+    parser.add_argument('--out_basename', type=str, default="even_render_6k_voxel", help='The basename of the output directory')
+    
+    parser.add_argument('--debug', action='store_true', help='Debug mode')
+
+    dataset_utils.add_args(parser)
+    parser.add_argument('--rank', type=int, default=0)
+    parser.add_argument('--world_size', type=int, default=1)
+    parser.add_argument('--max_workers', type=int, default=32)
+    opt = parser.parse_args(sys.argv[2:])
+    opt = edict(vars(opt))
+
+    output_dir = os.path.join(opt.output_dir, opt.out_basename)
+    for level in range(1, 5):
+        os.makedirs(os.path.join(output_dir, f'level_{level}'), exist_ok=True)
+
+    print(opt)
+    
+    print('Checking blender...', flush=True)
+
+    # get file list
+    if not os.path.exists(os.path.join(opt.metadata_dir, 'metadata_3didlight_6k_new.csv')):
+        raise ValueError('metadata_3didlight_6k_new.csv not found')
+    metadata = pd.read_csv(os.path.join(opt.metadata_dir, 'metadata_3didlight_6k_new.csv'))
+
+
+    start = len(metadata) * opt.rank // opt.world_size
+    end = len(metadata) * (opt.rank + 1) // opt.world_size
+    metadata = metadata[start:end]
+
+    if opt.debug:
+        metadata = metadata.head(10)
+
+    records = []
+
+    print("filter out objects that are already processed")
+    metadata, records = filter_processed(metadata, opt)
+                
+    print(f'Processing {len(metadata)} objects...')
+
+    # process objects
+    func = partial(_voxelize, output_dir=opt.output_dir, out_basename=opt.out_basename)
+    voxelized = dataset_utils.foreach_instance(metadata, opt.output_dir, func, max_workers=opt.max_workers, desc='Voxelizing')
+    voxelized = pd.concat([voxelized, pd.DataFrame.from_records(records)])
+    voxelized.to_csv(os.path.join(opt.output_dir, f'voxelized_{opt.rank}.csv'), index=False)
